@@ -1,10 +1,10 @@
 package sip
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,7 +55,9 @@ type Manager struct {
 	mu         sync.Mutex
 	ua         *sipgo.UserAgent
 	srv        *sipgo.Server
+	client     *sipgo.Client
 	dialogs    *sipgo.DialogClientCache
+	inbound    sync.Map
 	listener   net.PacketConn
 	listenAddr *net.UDPAddr
 }
@@ -79,8 +81,18 @@ func (m *Manager) ensureServer() error {
 		return err
 	}
 
+	srv.OnInvite(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+		m.handleInvite(req, tx)
+	})
+
+	srv.OnAck(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+		if err := m.handleAck(req, tx); err != nil {
+			log.Debug().Err(err).Str("source", req.Source()).Msg("[sip] ack")
+		}
+	})
+
 	srv.OnBye(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
-		if err := m.dialogs.ReadBye(req, tx); err != nil {
+		if err := m.handleBye(req, tx); err != nil {
 			res := sipmsg.NewResponseFromRequest(req, 481, "Call/Transaction Does Not Exist", nil)
 			_ = tx.Respond(res)
 		}
@@ -113,6 +125,7 @@ func (m *Manager) ensureServer() error {
 
 	m.ua = ua
 	m.srv = srv
+	m.client = client
 	m.dialogs = sipgo.NewDialogClientCache(client, sipmsg.ContactHeader{})
 	m.listener = ln
 	m.listenAddr = addr
@@ -126,6 +139,123 @@ func (m *Manager) ensureServer() error {
 	log.Info().Stringer("addr", addr).Msg("[sip] listen udp")
 
 	return nil
+}
+
+func (m *Manager) handleInvite(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+	streamName := requestStreamName(req)
+	if streamName == "" {
+		res := sipmsg.NewResponseFromRequest(req, 400, "Bad Request", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	stream := streams.Get(streamName)
+	if stream == nil {
+		res := sipmsg.NewResponseFromRequest(req, 404, "Not Found", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	contact, localIP, err := m.contactHeader(req.Source())
+	if err != nil {
+		log.Warn().Err(err).Str("stream", streamName).Msg("[sip] contact")
+		res := sipmsg.NewResponseFromRequest(req, 500, "Server Error", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	dialogUA := &sipgo.DialogUA{
+		Client:     m.client,
+		ContactHDR: *contact,
+	}
+	dialog, err := dialogUA.ReadInvite(req, tx)
+	if err != nil {
+		res := sipmsg.NewResponseFromRequest(req, 400, "Bad Request", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	remoteAddr, codec, err := ParseOffer(req.Body(), supportedCodecs())
+	if err != nil {
+		log.Debug().Err(err).Str("stream", streamName).Msg("[sip] offer")
+		res := sipmsg.NewResponseFromRequest(req, 488, "Not Acceptable Here", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	localRTP, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+	if err != nil {
+		res := sipmsg.NewResponseFromRequest(req, 500, "Server Error", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	answer, err := BuildOffer(localIP, localRTP.LocalAddr().(*net.UDPAddr).Port, []*core.Codec{codec})
+	if err != nil {
+		_ = localRTP.Close()
+		res := sipmsg.NewResponseFromRequest(req, 500, "Server Error", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	conn := NewInboundConn(m, req, streamName)
+	conn.attachInbound(dialog, localRTP, remoteAddr, codec, answer)
+	conn.onClose = func() {
+		m.inbound.Delete(dialog.ID)
+		detachStreamConn(stream, conn)
+	}
+
+	dialog.OnState(func(state sipmsg.DialogState) {
+		if state == sipmsg.DialogStateEnded {
+			conn.close(false)
+		}
+	})
+
+	stream.AddProducer(conn)
+	if err = stream.AddConsumer(conn); err != nil {
+		_ = conn.Stop()
+		res := sipmsg.NewResponseFromRequest(req, 500, "Server Error", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	m.inbound.Store(dialog.ID, conn)
+	go m.runCall(conn, streamName, req.Source())
+
+	if err = dialog.Respond(200, "OK", answer, sipmsg.NewHeader("Content-Type", "application/sdp"), contact); err != nil {
+		log.Debug().Err(err).Str("stream", streamName).Msg("[sip] answer")
+		_ = conn.Stop()
+		return
+	}
+}
+
+func (m *Manager) handleAck(req *sipmsg.Request, tx sipmsg.ServerTransaction) error {
+	conn, err := m.inboundConn(req)
+	if err != nil {
+		return err
+	}
+	return conn.readAck(req, tx)
+}
+
+func (m *Manager) handleBye(req *sipmsg.Request, tx sipmsg.ServerTransaction) error {
+	conn, err := m.inboundConn(req)
+	if err == nil {
+		return conn.readBye(req, tx)
+	}
+	return m.dialogs.ReadBye(req, tx)
+}
+
+func (m *Manager) inboundConn(req *sipmsg.Request) (*Conn, error) {
+	id, err := sipmsg.DialogIDFromRequestUAS(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if value, ok := m.inbound.Load(id); ok {
+		return value.(*Conn), nil
+	}
+
+	return nil, sipgo.ErrDialogDoesNotExists
 }
 
 func (m *Manager) newConn(rawURL string) (*Conn, error) {
@@ -145,7 +275,7 @@ func (m *Manager) newConn(rawURL string) (*Conn, error) {
 	return NewConn(m, rawURL, uri), nil
 }
 
-func (m *Manager) contactHeader(dst sipmsg.Uri) (*sipmsg.ContactHeader, string, error) {
+func (m *Manager) contactHeader(target string) (*sipmsg.ContactHeader, string, error) {
 	if err := m.ensureServer(); err != nil {
 		return nil, "", err
 	}
@@ -158,12 +288,7 @@ func (m *Manager) contactHeader(dst sipmsg.Uri) (*sipmsg.ContactHeader, string, 
 	}
 
 	if host == "" {
-		port := dst.Port
-		if port == 0 {
-			port = 5060
-		}
-
-		conn, err := net.Dial("udp", net.JoinHostPort(dst.Host, strconv.Itoa(port)))
+		conn, err := net.Dial("udp", target)
 		if err != nil {
 			return nil, "", err
 		}
@@ -186,6 +311,27 @@ func (m *Manager) contactHeader(dst sipmsg.Uri) (*sipmsg.ContactHeader, string, 
 			Port:   m.listenAddr.Port,
 		},
 	}, host, nil
+}
+
+func (m *Manager) runCall(conn *Conn, src, dst string) {
+	err := conn.Start()
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		return
+	}
+
+	log.Warn().Err(err).Str("src", src).Str("dst", dst).Msg("[sip] call ended")
+}
+
+func requestStreamName(req *sipmsg.Request) string {
+	if req.Recipient.User != "" {
+		return req.Recipient.User
+	}
+
+	if to := req.To(); to != nil && to.Address.User != "" {
+		return to.Address.User
+	}
+
+	return ""
 }
 
 func Dial(rawURL string) (core.Producer, error) {

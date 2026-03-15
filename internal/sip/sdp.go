@@ -56,6 +56,14 @@ func BuildOffer(localIP string, localPort int, codecs []*core.Codec) ([]byte, er
 }
 
 func ParseAnswer(body []byte, offered []*core.Codec) (*net.UDPAddr, *core.Codec, error) {
+	return parseRemoteAudio(body, offered, "answer")
+}
+
+func ParseOffer(body []byte, supported []*core.Codec) (*net.UDPAddr, *core.Codec, error) {
+	return parseRemoteAudio(body, supported, "offer")
+}
+
+func parseRemoteAudio(body []byte, codecs []*core.Codec, kind string) (*net.UDPAddr, *core.Codec, error) {
 	sd := &sdp.SessionDescription{}
 	if err := sd.Unmarshal(body); err != nil {
 		return nil, nil, err
@@ -67,7 +75,7 @@ func ParseAnswer(body []byte, offered []*core.Codec) (*net.UDPAddr, *core.Codec,
 		}
 
 		remoteMedia := core.UnmarshalMedia(md)
-		for _, offeredCodec := range offered {
+		for _, offeredCodec := range codecs {
 			for _, remoteCodec := range remoteMedia.Codecs {
 				if !offeredCodec.Match(remoteCodec) {
 					continue
@@ -96,5 +104,5 @@ func ParseAnswer(body []byte, offered []*core.Codec) (*net.UDPAddr, *core.Codec,
 		}
 	}
 
-	return nil, nil, fmt.Errorf("sip: no matching codec in answer")
+	return nil, nil, fmt.Errorf("sip: no matching codec in %s", kind)
 }

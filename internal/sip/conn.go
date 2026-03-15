@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -24,7 +25,9 @@ type Conn struct {
 	mu         sync.RWMutex
 	started    bool
 	stopped    bool
-	dialog     *sipgo.DialogClientSession
+	clientDlg  *sipgo.DialogClientSession
+	serverDlg  *sipgo.DialogServerSession
+	onClose    func()
 	cancel     context.CancelCauseFunc
 	rtpConn    *net.UDPConn
 	remoteAddr *net.UDPAddr
@@ -33,6 +36,25 @@ type Conn struct {
 }
 
 func NewConn(manager *Manager, rawURL string, uri sipmsg.Uri) *Conn {
+	conn := newConn(manager, rawURL, uri.HostPort())
+	conn.uri = uri
+	return conn
+}
+
+func NewInboundConn(manager *Manager, req *sipmsg.Request, streamName string) *Conn {
+	source := req.Recipient.String()
+	if source == "" {
+		source = "sip:" + streamName
+	}
+
+	conn := newConn(manager, source, req.Source())
+	conn.Source = source
+	conn.URL = source
+	conn.RemoteAddr = req.Source()
+	return conn
+}
+
+func newConn(manager *Manager, source, remote string) *Conn {
 	medias := []*core.Media{
 		{
 			Kind:      core.KindAudio,
@@ -51,14 +73,29 @@ func NewConn(manager *Manager, rawURL string, uri sipmsg.Uri) *Conn {
 			ID:         core.NewID(),
 			FormatName: "sip",
 			Protocol:   "sip+udp",
-			RemoteAddr: uri.HostPort(),
-			Source:     rawURL,
-			URL:        rawURL,
+			RemoteAddr: remote,
+			Source:     source,
+			URL:        source,
 			Medias:     medias,
 		},
 		manager: manager,
-		uri:     uri,
 	}
+}
+
+func (c *Conn) attachInbound(
+	dialog *sipgo.DialogServerSession,
+	rtpConn *net.UDPConn,
+	remoteAddr *net.UDPAddr,
+	codec *core.Codec,
+	answer []byte,
+) {
+	c.mu.Lock()
+	c.serverDlg = dialog
+	c.rtpConn = rtpConn
+	c.remoteAddr = remoteAddr
+	c.codec = codec
+	c.SDP = string(answer)
+	c.mu.Unlock()
 }
 
 func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
@@ -105,7 +142,7 @@ func (c *Conn) Start() error {
 	defer cancel(nil)
 	defer c.close(false)
 
-	if err := c.invite(ctx); err != nil {
+	if err := c.prepare(ctx); err != nil {
 		return err
 	}
 
@@ -137,6 +174,18 @@ func (c *Conn) Stop() error {
 	return nil
 }
 
+func (c *Conn) prepare(parent context.Context) error {
+	c.mu.RLock()
+	ready := c.rtpConn != nil && c.remoteAddr != nil && c.codec != nil
+	c.mu.RUnlock()
+
+	if ready {
+		return nil
+	}
+
+	return c.invite(parent)
+}
+
 func (c *Conn) invite(parent context.Context) error {
 	localRTP, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
 	if err != nil {
@@ -144,7 +193,8 @@ func (c *Conn) invite(parent context.Context) error {
 	}
 
 	localPort := localRTP.LocalAddr().(*net.UDPAddr).Port
-	contact, localIP, err := c.manager.contactHeader(c.uri)
+	hostPort := net.JoinHostPort(c.uri.Host, strconv.Itoa(defaultSIPPort(c.uri.Port)))
+	contact, localIP, err := c.manager.contactHeader(hostPort)
 	if err != nil {
 		_ = localRTP.Close()
 		return err
@@ -194,7 +244,7 @@ func (c *Conn) invite(parent context.Context) error {
 	}
 
 	c.mu.Lock()
-	c.dialog = dialog
+	c.clientDlg = dialog
 	c.rtpConn = localRTP
 	c.remoteAddr = remoteAddr
 	c.codec = codec
@@ -265,19 +315,27 @@ func (c *Conn) close(sendBye bool) {
 	c.stopped = true
 
 	cancel := c.cancel
-	dialog := c.dialog
+	clientDlg := c.clientDlg
+	serverDlg := c.serverDlg
 	rtpConn := c.rtpConn
 	senders := append([]*core.Sender(nil), c.Senders...)
 	receivers := append([]*core.Receiver(nil), c.Receivers...)
+	onClose := c.onClose
 	c.mu.Unlock()
 
 	if cancel != nil {
 		cancel(errors.New("sip closed"))
 	}
 
-	if sendBye && dialog != nil {
+	if sendBye && clientDlg != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = dialog.Bye(ctx)
+		_ = clientDlg.Bye(ctx)
+		cancel()
+	}
+
+	if sendBye && serverDlg != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = serverDlg.Bye(ctx)
 		cancel()
 	}
 
@@ -292,6 +350,41 @@ func (c *Conn) close(sendBye bool) {
 	for _, receiver := range receivers {
 		receiver.Close()
 	}
+
+	if onClose != nil {
+		onClose()
+	}
+}
+
+func (c *Conn) readAck(req *sipmsg.Request, tx sipmsg.ServerTransaction) error {
+	c.mu.RLock()
+	dialog := c.serverDlg
+	c.mu.RUnlock()
+
+	if dialog == nil {
+		return sipgo.ErrDialogDoesNotExists
+	}
+
+	return dialog.ReadAck(req, tx)
+}
+
+func (c *Conn) readBye(req *sipmsg.Request, tx sipmsg.ServerTransaction) error {
+	c.mu.RLock()
+	dialog := c.serverDlg
+	c.mu.RUnlock()
+
+	if dialog == nil {
+		return sipgo.ErrDialogDoesNotExists
+	}
+
+	return dialog.ReadBye(req, tx)
+}
+
+func defaultSIPPort(port int) int {
+	if port == 0 {
+		return 5060
+	}
+	return port
 }
 
 func supportedCodecs() []*core.Codec {

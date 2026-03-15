@@ -1,10 +1,11 @@
 # SIP
 
-This module adds outbound SIP audio calls to go2rtc.
+This module adds SIP audio calls to go2rtc.
 
 Current scope:
 
 - outbound SIP over UDP
+- inbound SIP `INVITE` over UDP
 - audio only
 - `PCMA/8000` and `PCMU/8000`
 - bidirectional RTP audio bridge
@@ -19,7 +20,7 @@ sip:
   timeout: 30      # optional, INVITE timeout in seconds
 ```
 
-`listen` is the local SIP socket go2rtc uses for outbound dialogs and incoming `BYE` requests from the softphone.
+`listen` is the local SIP socket go2rtc uses for outbound dialogs and for inbound calls. Leave it as `:0` if you only need outbound dialing. Set it to a fixed reachable address or port, for example `:5060`, if a PBX or softphone will call go2rtc.
 
 ## Stream source
 
@@ -38,6 +39,67 @@ When the stream gets a consumer, go2rtc will:
 2. place an outbound SIP call
 3. bridge stream audio to the softphone
 4. inject microphone RTP from the softphone back into the stream pipeline
+
+## Inbound Calls
+
+If your phone or PBX should call the doorbell on demand, point the SIP call at the go2rtc listener and use the stream name as the SIP user:
+
+```text
+sip:doorbell@go2rtc-host:5060
+```
+
+For example, if the stream is named `front-doorbell`, dialing `sip:front-doorbell@go2rtc-host:5060` will attach that call to the `front-doorbell` stream.
+
+This only needs a fixed SIP listener:
+
+```yaml
+sip:
+  listen: ":5060"
+```
+
+When go2rtc answers the call it will:
+
+1. match the called SIP user to an existing stream name
+2. answer with `PCMA` or `PCMU`
+3. send stream audio to the caller
+4. inject caller microphone RTP back into the stream pipeline
+
+## Asterisk Example
+
+Register your softphone to Asterisk as usual, then route a local extension to go2rtc:
+
+```ini
+; pjsip.conf
+[go2rtc]
+type=endpoint
+transport=transport-udp
+context=from-go2rtc
+disallow=all
+allow=ulaw,alaw
+aors=go2rtc
+
+[go2rtc]
+type=aor
+contact=sip:go2rtc-host:5060
+```
+
+```ini
+; extensions.conf
+[from-internal]
+exten => 7001,1,Dial(PJSIP/front-doorbell@go2rtc)
+```
+
+In that example:
+
+- your phone dials extension `7001`
+- Asterisk sends `INVITE sip:front-doorbell@go2rtc-host:5060`
+- go2rtc answers and bridges the call to the `front-doorbell` stream
+
+If you prefer, Asterisk can also route the literal stream name:
+
+```ini
+exten => front-doorbell,1,Dial(PJSIP/front-doorbell@go2rtc)
+```
 
 ## HTTP API
 
@@ -83,3 +145,4 @@ rest_command:
 - The current implementation negotiates `PCMA` or `PCMU`.
 - For best results, make sure the source stream exposes G.711 audio directly or via an existing transcoding source.
 - Video is not sent through SIP in this version.
+- Inbound calling only matches existing go2rtc stream names; there is no SIP registration database inside go2rtc.

@@ -1,9 +1,6 @@
 package sip
 
 import (
-	"context"
-	"errors"
-	"net"
 	"net/http"
 
 	"github.com/AlexxIT/go2rtc/internal/api"
@@ -46,6 +43,11 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		conn.onClose = func() {
+			calls.Delete(src)
+			detachStreamConn(stream, conn)
+		}
+
 		stream.AddProducer(conn)
 		if err = stream.AddConsumer(conn); err != nil {
 			stream.RemoveProducer(conn)
@@ -57,16 +59,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		current := &call{stream: stream, conn: conn}
 		calls.Store(src, current)
 
-		go func() {
-			err := conn.Start()
-			stopCall(src, current)
-
-			if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
-				return
-			}
-
-			log.Warn().Err(err).Str("src", src).Str("dst", dst).Msg("[sip] call ended")
-		}()
+		go manager.runCall(conn, src, dst)
 
 		w.WriteHeader(http.StatusCreated)
 
@@ -84,7 +77,10 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 
 func stopCall(key string, current *call) {
 	calls.Delete(key)
+	detachStreamConn(current.stream, current.conn)
+}
 
-	current.stream.RemoveProducer(current.conn)
-	current.stream.RemoveConsumer(current.conn)
+func detachStreamConn(stream *streams.Stream, conn *Conn) {
+	stream.RemoveProducer(conn)
+	stream.RemoveConsumer(conn)
 }
