@@ -57,6 +57,7 @@ Some formats and protocols go2rtc supports exclusively. They have no equivalent 
 | [`rtmp`]       | `flv`           | `rtmp`           | yes   | yes    | yes    |         |
 | [`rtmp`]       | `flv`           | `http`           |       | yes    | yes    |         |
 | [`rtsp`]       | `rtsp`          | `rtsp`           | yes   | yes    | yes    | yes     |
+| [`sip`]        | `rtp`           | `sip`, `udp`     | yes   |        |        | yes     |
 | [`tapo`]       | `mpegts`        | `http`           | yes   |        |        | yes     |
 | [`tuya`]       | `srtp`          | `webrtc`         | yes   |        |        | yes     |
 | [`v4l2`]       | `rawvideo`      | `ioctl`          | yes   |        |        |         |
@@ -100,6 +101,7 @@ Some formats and protocols go2rtc supports exclusively. They have no equivalent 
 [`roborock`]: roborock/README.md
 [`rtmp`]: rtmp/README.md
 [`rtsp`]: rtsp/README.md
+[`sip`]: sip/README.md
 [`srtp`]: srtp/README.md
 [`streams`]: streams/README.md
 [`tapo`]: tapo/README.md

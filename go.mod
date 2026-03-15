@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/asticode/go-astits v1.14.0
 	github.com/eclipse/paho.mqtt.golang v1.5.1
+	github.com/emiago/sipgo v1.2.1
 	github.com/expr-lang/expr v1.17.7
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
@@ -32,6 +33,10 @@ require (
 require (
 	github.com/asticode/go-astikit v0.57.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/gobwas/httphead v0.1.0 // indirect
+	github.com/gobwas/pool v0.2.1 // indirect
+	github.com/gobwas/ws v1.3.2 // indirect
+	github.com/icholy/digest v1.1.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
