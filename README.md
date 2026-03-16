@@ -178,6 +178,7 @@ A summary table of all modules and features can be found [here](internal/README.
 - [`onvif`](internal/onvif/README.md#onvif-client) - A popular [ONVIF](https://en.wikipedia.org/wiki/ONVIF) protocol for receiving media in RTSP format.
 - [`rtmp`](internal/rtmp/README.md#rtmp-client) - The legacy but still used [RTMP](https://en.wikipedia.org/wiki/Real-Time_Messaging_Protocol) protocol for real-time media transmission.
 - [`rtsp`](internal/rtsp/README.md#rtsp-client) - The most common [RTSP](https://en.wikipedia.org/wiki/Real-Time_Streaming_Protocol) protocol for real-time media transmission.
+- [`sip`](internal/sip/README.md) - [SIP](https://en.wikipedia.org/wiki/Session_Initiation_Protocol) audio/video calls for local intercom and doorbell flows.
 - [`webrtc`](internal/webrtc/README.md#webrtc-client) - [WebRTC](https://en.wikipedia.org/wiki/WebRTC) web-compatible protocol for real-time media transmission.
 - [`yuv4mpegpipe`](internal/http/README.md#tcp) - Raw [YUV](https://en.wikipedia.org/wiki/Y%E2%80%B2UV) frame stream with [YUV4MPEG](https://manned.org/yuv4mpeg) header.
 
@@ -280,6 +281,7 @@ Supported for:
 [`ring`](internal/ring/README.md), 
 [`roborock`](internal/roborock/README.md), 
 [`rtsp`](internal/rtsp/README.md#two-way-audio), 
+[`sip`](internal/sip/README.md),
 [`tapo`](internal/tapo/README.md), 
 [`tuya`](internal/tuya/README.md), 
 [`webrtc`](internal/webrtc/README.md), 
