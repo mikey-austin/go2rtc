@@ -77,7 +77,7 @@ type=endpoint
 transport=transport-udp
 context=from-go2rtc
 disallow=all
-allow=ulaw,alaw
+allow=ulaw,alaw,h264
 aors=go2rtc
 
 [go2rtc]
@@ -147,5 +147,6 @@ rest_command:
 - The current implementation negotiates `PCMA` or `PCMU` for audio.
 - Video is send-only from go2rtc to the SIP peer, with no video backchannel.
 - Video is passthrough only. If the source stream does not expose RTP `H264` or `H265`, SIP video will not be negotiated.
+- If you route calls through Asterisk, the endpoint that calls go2rtc must allow video codecs too, for example `allow=ulaw,alaw,h264`.
 - For best results, make sure the source stream exposes G.711 audio directly or via an existing transcoding source.
 - Inbound calling only matches existing go2rtc stream names; there is no SIP registration database inside go2rtc.
