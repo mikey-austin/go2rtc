@@ -29,8 +29,9 @@ type mediaSession struct {
 type Conn struct {
 	core.Connection
 
-	manager *Manager
-	uri     sipmsg.Uri
+	manager     *Manager
+	uri         sipmsg.Uri
+	displayName string
 
 	mu        sync.RWMutex
 	started   bool
@@ -240,6 +241,20 @@ func (c *Conn) invite(parent context.Context) error {
 	req.SetBody(offer)
 	req.AppendHeader(contact)
 	req.AppendHeader(sipmsg.NewHeader("Content-Type", "application/sdp"))
+
+	if c.displayName != "" {
+		params := sipmsg.NewParams()
+		params.Add("tag", sipmsg.GenerateTagN(16))
+		req.AppendHeader(&sipmsg.FromHeader{
+			DisplayName: c.displayName,
+			Address: sipmsg.Uri{
+				Scheme: c.uri.Scheme,
+				User:   contact.Address.User,
+				Host:   contact.Address.Host,
+			},
+			Params: params,
+		})
+	}
 
 	ctx, cancel := context.WithTimeout(parent, c.manager.timeout)
 	defer cancel()

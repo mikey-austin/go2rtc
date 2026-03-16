@@ -17,8 +17,9 @@ Current scope:
 
 ```yaml
 sip:
-  listen: ":5060"  # optional, default ":0" for ephemeral local SIP port
-  timeout: 30      # optional, INVITE timeout in seconds
+  listen: ":5060"            # optional, default ":0" for ephemeral local SIP port
+  timeout: 30                # optional, INVITE timeout in seconds
+  display_name: "Front Door" # optional, SIP From display name for outbound calls
 ```
 
 `listen` is the local SIP socket go2rtc uses for outbound dialogs and for inbound calls. Leave it as `:0` if you only need outbound dialing. Set it to a fixed reachable address or port, for example `:5060`, if a PBX or softphone will call go2rtc.

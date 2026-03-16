@@ -43,6 +43,12 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if name := r.URL.Query().Get("name"); name != "" {
+			conn.displayName = name
+		} else if conn.displayName == "" {
+			conn.displayName = src
+		}
+
 		conn.onClose = func() {
 			calls.Delete(src)
 			detachStreamConn(stream, conn)

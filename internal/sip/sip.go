@@ -19,8 +19,9 @@ import (
 )
 
 type Config struct {
-	Listen  string `yaml:"listen"`
-	Timeout int    `yaml:"timeout"`
+	Listen      string `yaml:"listen"`
+	Timeout     int    `yaml:"timeout"`
+	DisplayName string `yaml:"display_name"`
 }
 
 func Init() {
@@ -34,8 +35,9 @@ func Init() {
 
 	log = app.GetLogger("sip")
 	manager = &Manager{
-		listen:  cfg.Mod.Listen,
-		timeout: time.Duration(cfg.Mod.Timeout) * time.Second,
+		listen:      cfg.Mod.Listen,
+		timeout:     time.Duration(cfg.Mod.Timeout) * time.Second,
+		displayName: cfg.Mod.DisplayName,
 	}
 
 	streams.HandleFunc("sip", Dial)
@@ -57,8 +59,9 @@ var (
 )
 
 type Manager struct {
-	listen  string
-	timeout time.Duration
+	listen      string
+	timeout     time.Duration
+	displayName string
 
 	mu         sync.Mutex
 	ua         *sipgo.UserAgent
@@ -289,7 +292,9 @@ func (m *Manager) newConn(rawURL string) (*Conn, error) {
 		return nil, fmt.Errorf("sip: unsupported transport: %s", transport)
 	}
 
-	return NewConn(m, rawURL, uri), nil
+	conn := NewConn(m, rawURL, uri)
+	conn.displayName = m.displayName
+	return conn, nil
 }
 
 func (m *Manager) contactHeader(target string) (*sipmsg.ContactHeader, string, error) {

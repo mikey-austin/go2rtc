@@ -41,6 +41,7 @@ func TestConnInviteAndRTPBridge(t *testing.T) {
 
 	conn, err := manager.newConn("sip:doorbell@" + server.addr)
 	require.NoError(t, err)
+	conn.displayName = "Front Doorbell"
 
 	audioInTrack, err := conn.GetTrack(conn.Medias[1], testAudioCodec)
 	require.NoError(t, err)
@@ -80,6 +81,7 @@ func TestConnInviteAndRTPBridge(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for ACK")
 	}
+	require.Equal(t, "Front Doorbell", server.fromDisplayName)
 
 	serverAudio := &rtp.Packet{
 		Header: rtp.Header{
@@ -333,15 +335,16 @@ func TestConnAcceptsInboundInviteAndRTPBridge(t *testing.T) {
 }
 
 type testServer struct {
-	audioRTP      *net.UDPConn
-	videoRTP      *net.UDPConn
-	addr          string
-	remote        map[string]*NegotiatedMedia
-	acked         chan struct{}
-	byed          chan struct{}
-	audioReceived chan *rtp.Packet
-	videoReceived chan *rtp.Packet
-	errs          chan error
+	audioRTP        *net.UDPConn
+	videoRTP        *net.UDPConn
+	addr            string
+	remote          map[string]*NegotiatedMedia
+	fromDisplayName string
+	acked           chan struct{}
+	byed            chan struct{}
+	audioReceived   chan *rtp.Packet
+	videoReceived   chan *rtp.Packet
+	errs            chan error
 }
 
 func startTestSIPServer(t *testing.T) *testServer {
@@ -390,6 +393,10 @@ func startTestSIPServer(t *testing.T) *testServer {
 	}
 
 	srv.OnInvite(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+		if from := req.From(); from != nil {
+			ts.fromDisplayName = from.DisplayName
+		}
+
 		answerMedias, remote, err := AnswerOffer(req.Body(), serverMedias)
 		if err != nil {
 			ts.errs <- err
