@@ -1,13 +1,14 @@
 # SIP
 
-This module adds SIP audio calls to go2rtc.
+This module adds SIP audio and video calls to go2rtc.
 
 Current scope:
 
 - outbound SIP over UDP
 - inbound SIP `INVITE` over UDP
-- audio only
+- one-way video from go2rtc to the SIP peer
 - `PCMA/8000` and `PCMU/8000`
+- `H264/90000` and `H265/90000` passthrough when the source stream exposes them
 - bidirectional RTP audio bridge
 - `sip:` stream source
 - `POST`/`DELETE /api/sip` for on-demand dialing
@@ -37,7 +38,7 @@ When the stream gets a consumer, go2rtc will:
 
 1. start the regular source, for example RTSP
 2. place an outbound SIP call
-3. bridge stream audio to the softphone
+3. bridge stream audio and video to the softphone
 4. inject microphone RTP from the softphone back into the stream pipeline
 
 ## Inbound Calls
@@ -60,8 +61,8 @@ sip:
 When go2rtc answers the call it will:
 
 1. match the called SIP user to an existing stream name
-2. answer with `PCMA` or `PCMU`
-3. send stream audio to the caller
+2. answer with `PCMA` or `PCMU`, plus `H264` or `H265` if the stream has video
+3. send stream audio and video to the caller
 4. inject caller microphone RTP back into the stream pipeline
 
 ## Asterisk Example
@@ -142,7 +143,8 @@ rest_command:
 
 ## Notes
 
-- The current implementation negotiates `PCMA` or `PCMU`.
+- The current implementation negotiates `PCMA` or `PCMU` for audio.
+- Video is send-only from go2rtc to the SIP peer, with no video backchannel.
+- Video is passthrough only. If the source stream does not expose RTP `H264` or `H265`, SIP video will not be negotiated.
 - For best results, make sure the source stream exposes G.711 audio directly or via an existing transcoding source.
-- Video is not sent through SIP in this version.
 - Inbound calling only matches existing go2rtc stream names; there is no SIP registration database inside go2rtc.

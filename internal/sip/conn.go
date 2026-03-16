@@ -16,23 +16,31 @@ import (
 	"github.com/pion/rtp"
 )
 
+var errSIPClosed = errors.New("sip closed")
+
+type mediaSession struct {
+	kind       string
+	rtpConn    *net.UDPConn
+	remoteAddr *net.UDPAddr
+	codec      *core.Codec
+	receive    bool
+}
+
 type Conn struct {
 	core.Connection
 
 	manager *Manager
 	uri     sipmsg.Uri
 
-	mu         sync.RWMutex
-	started    bool
-	stopped    bool
-	clientDlg  *sipgo.DialogClientSession
-	serverDlg  *sipgo.DialogServerSession
-	onClose    func()
-	cancel     context.CancelCauseFunc
-	rtpConn    *net.UDPConn
-	remoteAddr *net.UDPAddr
-	codec      *core.Codec
-	readErr    error
+	mu        sync.RWMutex
+	started   bool
+	stopped   bool
+	clientDlg *sipgo.DialogClientSession
+	serverDlg *sipgo.DialogServerSession
+	onClose   func()
+	cancel    context.CancelCauseFunc
+	sessions  map[string]*mediaSession
+	readErr   error
 }
 
 func NewConn(manager *Manager, rawURL string, uri sipmsg.Uri) *Conn {
@@ -59,12 +67,17 @@ func newConn(manager *Manager, source, remote string) *Conn {
 		{
 			Kind:      core.KindAudio,
 			Direction: core.DirectionSendonly,
-			Codecs:    supportedCodecs(),
+			Codecs:    supportedAudioCodecs(),
 		},
 		{
 			Kind:      core.KindAudio,
 			Direction: core.DirectionRecvonly,
-			Codecs:    supportedCodecs(),
+			Codecs:    supportedAudioCodecs(),
+		},
+		{
+			Kind:      core.KindVideo,
+			Direction: core.DirectionSendonly,
+			Codecs:    supportedVideoCodecs(),
 		},
 	}
 
@@ -84,18 +97,17 @@ func newConn(manager *Manager, source, remote string) *Conn {
 
 func (c *Conn) attachInbound(
 	dialog *sipgo.DialogServerSession,
-	rtpConn *net.UDPConn,
-	remoteAddr *net.UDPAddr,
-	codec *core.Codec,
+	sessions map[string]*mediaSession,
+	remote map[string]*NegotiatedMedia,
 	answer []byte,
 ) {
 	c.mu.Lock()
 	c.serverDlg = dialog
-	c.rtpConn = rtpConn
-	c.remoteAddr = remoteAddr
-	c.codec = codec
+	c.sessions = sessions
 	c.SDP = string(answer)
 	c.mu.Unlock()
+
+	c.applyNegotiated(remote)
 }
 
 func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
@@ -103,7 +115,7 @@ func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, e
 	defer c.mu.Unlock()
 
 	for _, receiver := range c.Receivers {
-		if receiver.Codec.Match(codec) {
+		if receiver.Media.Kind == media.Kind && receiver.Codec.Match(codec) {
 			return receiver, nil
 		}
 	}
@@ -114,8 +126,8 @@ func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, e
 }
 
 func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
-	sender := core.NewSender(media, codec.Clone())
-	sender.Handler = c.outboundHandler(track.Codec.Clone())
+	sender := core.NewSender(media, track.Codec.Clone())
+	sender.Handler = c.outboundHandler(media.Kind, track.Codec.Clone())
 	sender.HandleRTP(track)
 
 	c.mu.Lock()
@@ -146,27 +158,45 @@ func (c *Conn) Start() error {
 		return err
 	}
 
-	buf := make([]byte, 1500)
-	for {
-		n, _, err := c.rtpConn.ReadFromUDP(buf)
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) || context.Cause(ctx) != nil {
-				return nil
-			}
-			c.mu.Lock()
-			c.readErr = err
-			c.mu.Unlock()
-			return err
-		}
+	c.mu.RLock()
+	sessions := cloneSessions(c.sessions)
+	c.mu.RUnlock()
 
-		packet := &rtp.Packet{}
-		if err = packet.Unmarshal(buf[:n]); err != nil {
+	readers := 0
+	errCh := make(chan error, len(sessions))
+	for _, session := range sessions {
+		if !session.receive || session.rtpConn == nil {
 			continue
 		}
-
-		c.Recv += n
-		c.dispatchInbound(packet)
+		readers++
+		go c.readLoop(ctx, session, errCh)
 	}
+
+	if readers == 0 {
+		<-ctx.Done()
+		if cause := context.Cause(ctx); cause != nil && !isExpectedClose(cause) {
+			return cause
+		}
+		return nil
+	}
+
+	for readers > 0 {
+		select {
+		case err := <-errCh:
+			readers--
+			if err == nil {
+				continue
+			}
+			return err
+		case <-ctx.Done():
+			if cause := context.Cause(ctx); cause != nil && !isExpectedClose(cause) {
+				return cause
+			}
+			return nil
+		}
+	}
+
+	return nil
 }
 
 func (c *Conn) Stop() error {
@@ -176,7 +206,7 @@ func (c *Conn) Stop() error {
 
 func (c *Conn) prepare(parent context.Context) error {
 	c.mu.RLock()
-	ready := c.rtpConn != nil && c.remoteAddr != nil && c.codec != nil
+	ready := len(c.sessions) > 0
 	c.mu.RUnlock()
 
 	if ready {
@@ -187,22 +217,21 @@ func (c *Conn) prepare(parent context.Context) error {
 }
 
 func (c *Conn) invite(parent context.Context) error {
-	localRTP, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+	localMedias, sessions, ports, err := c.localMedias()
 	if err != nil {
 		return err
 	}
 
-	localPort := localRTP.LocalAddr().(*net.UDPAddr).Port
 	hostPort := net.JoinHostPort(c.uri.Host, strconv.Itoa(defaultSIPPort(c.uri.Port)))
 	contact, localIP, err := c.manager.contactHeader(hostPort)
 	if err != nil {
-		_ = localRTP.Close()
+		closeSessions(sessions)
 		return err
 	}
 
-	offer, err := BuildOffer(localIP, localPort, supportedCodecs())
+	offer, err := BuildOffer(localIP, ports, localMedias)
 	if err != nil {
-		_ = localRTP.Close()
+		closeSessions(sessions)
 		return err
 	}
 
@@ -217,7 +246,7 @@ func (c *Conn) invite(parent context.Context) error {
 
 	dialog, err := c.manager.dialogs.WriteInvite(ctx, req)
 	if err != nil {
-		_ = localRTP.Close()
+		closeSessions(sessions)
 		return err
 	}
 
@@ -228,71 +257,161 @@ func (c *Conn) invite(parent context.Context) error {
 	})
 
 	if err = dialog.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
-		_ = localRTP.Close()
+		closeSessions(sessions)
 		return err
 	}
 
 	if err = dialog.Ack(context.Background()); err != nil {
-		_ = localRTP.Close()
+		closeSessions(sessions)
 		return err
 	}
 
-	remoteAddr, codec, err := ParseAnswer(dialog.InviteResponse.Body(), supportedCodecs())
+	remote, err := ParseAnswer(dialog.InviteResponse.Body(), localMedias)
 	if err != nil {
-		_ = localRTP.Close()
+		closeSessions(sessions)
 		return err
 	}
 
 	c.mu.Lock()
 	c.clientDlg = dialog
-	c.rtpConn = localRTP
-	c.remoteAddr = remoteAddr
-	c.codec = codec
+	c.sessions = sessions
 	c.SDP = string(dialog.InviteResponse.Body())
 	c.mu.Unlock()
 
+	c.applyNegotiated(remote)
 	return nil
 }
 
-func (c *Conn) dispatchInbound(packet *rtp.Packet) {
+func (c *Conn) localMedias() ([]*core.Media, map[string]*mediaSession, map[string]int, error) {
 	c.mu.RLock()
-	codec := c.codec
+	senders := append([]*core.Sender(nil), c.Senders...)
 	receivers := append([]*core.Receiver(nil), c.Receivers...)
 	c.mu.RUnlock()
 
-	if codec == nil {
+	sendAudio := collectSenderCodecs(senders, core.KindAudio)
+	recvAudio := collectReceiverCodecs(receivers, core.KindAudio)
+	sendVideo := collectSenderCodecs(senders, core.KindVideo)
+
+	medias := make([]*core.Media, 0, 2)
+	sessions := make(map[string]*mediaSession, 2)
+	ports := make(map[string]int, 2)
+
+	if media := buildLocalMedia(core.KindAudio, sendAudio, recvAudio); media != nil {
+		session, err := newMediaSession(media.Kind)
+		if err != nil {
+			closeSessions(sessions)
+			return nil, nil, nil, err
+		}
+		sessions[media.Kind] = session
+		ports[media.Kind] = session.rtpConn.LocalAddr().(*net.UDPAddr).Port
+		medias = append(medias, media)
+	}
+
+	if media := buildLocalMedia(core.KindVideo, sendVideo, nil); media != nil {
+		session, err := newMediaSession(media.Kind)
+		if err != nil {
+			closeSessions(sessions)
+			return nil, nil, nil, err
+		}
+		sessions[media.Kind] = session
+		ports[media.Kind] = session.rtpConn.LocalAddr().(*net.UDPAddr).Port
+		medias = append(medias, media)
+	}
+
+	if len(medias) == 0 {
+		return nil, nil, nil, errors.New("sip: no compatible medias")
+	}
+
+	return medias, sessions, ports, nil
+}
+
+func (c *Conn) applyNegotiated(remote map[string]*NegotiatedMedia) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for kind, session := range c.sessions {
+		negotiated, ok := remote[kind]
+		if !ok {
+			if session.rtpConn != nil {
+				_ = session.rtpConn.Close()
+			}
+			delete(c.sessions, kind)
+			continue
+		}
+
+		session.remoteAddr = negotiated.Addr
+		session.codec = negotiated.Codec
+		session.receive = mediaCanRecv(negotiated.Direction)
+	}
+}
+
+func (c *Conn) readLoop(ctx context.Context, session *mediaSession, errCh chan<- error) {
+	buf := make([]byte, 1500)
+	for {
+		n, _, err := session.rtpConn.ReadFromUDP(buf)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) || context.Cause(ctx) != nil {
+				errCh <- nil
+				return
+			}
+			c.mu.Lock()
+			c.readErr = err
+			c.mu.Unlock()
+			errCh <- err
+			return
+		}
+
+		packet := &rtp.Packet{}
+		if err = packet.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+
+		c.Recv += n
+		c.dispatchInbound(session.kind, packet)
+	}
+}
+
+func (c *Conn) dispatchInbound(kind string, packet *rtp.Packet) {
+	c.mu.RLock()
+	session := c.sessions[kind]
+	receivers := append([]*core.Receiver(nil), c.Receivers...)
+	c.mu.RUnlock()
+
+	if session == nil || session.codec == nil {
 		return
 	}
 
 	for _, receiver := range receivers {
+		if receiver.Media.Kind != kind {
+			continue
+		}
+
 		clone := *packet
 		clone.PayloadType = receiver.Codec.PayloadType
 
-		if receiver.Codec.Name != codec.Name {
-			clone.Payload = pcm.Transcode(receiver.Codec, codec)(packet.Payload)
+		if receiver.Codec.Name != session.codec.Name {
+			clone.Payload = pcm.Transcode(receiver.Codec, session.codec)(packet.Payload)
 		}
 
 		receiver.WriteRTP(&clone)
 	}
 }
 
-func (c *Conn) outboundHandler(src *core.Codec) core.HandlerFunc {
+func (c *Conn) outboundHandler(kind string, src *core.Codec) core.HandlerFunc {
 	return func(packet *rtp.Packet) {
 		c.mu.RLock()
-		codec := c.codec
-		rtpConn := c.rtpConn
-		remoteAddr := c.remoteAddr
+		session := c.sessions[kind]
 		c.mu.RUnlock()
 
-		if codec == nil || rtpConn == nil || remoteAddr == nil {
+		if session == nil || session.codec == nil || session.rtpConn == nil || session.remoteAddr == nil {
 			return
 		}
 
 		clone := *packet
-		clone.PayloadType = codec.PayloadType
+		clone.PayloadType = session.codec.PayloadType
 
-		if src.Name != codec.Name {
-			clone.Payload = pcm.Transcode(codec, src)(packet.Payload)
+		if src.Name != session.codec.Name {
+			clone.Payload = pcm.Transcode(session.codec, src)(packet.Payload)
 		}
 
 		data, err := clone.Marshal()
@@ -300,7 +419,7 @@ func (c *Conn) outboundHandler(src *core.Codec) core.HandlerFunc {
 			return
 		}
 
-		if _, err = rtpConn.WriteToUDP(data, remoteAddr); err == nil {
+		if _, err = session.rtpConn.WriteToUDP(data, session.remoteAddr); err == nil {
 			c.Send += len(data)
 		}
 	}
@@ -317,14 +436,14 @@ func (c *Conn) close(sendBye bool) {
 	cancel := c.cancel
 	clientDlg := c.clientDlg
 	serverDlg := c.serverDlg
-	rtpConn := c.rtpConn
 	senders := append([]*core.Sender(nil), c.Senders...)
 	receivers := append([]*core.Receiver(nil), c.Receivers...)
+	sessions := cloneSessions(c.sessions)
 	onClose := c.onClose
 	c.mu.Unlock()
 
 	if cancel != nil {
-		cancel(errors.New("sip closed"))
+		cancel(errSIPClosed)
 	}
 
 	if sendBye && clientDlg != nil {
@@ -339,9 +458,7 @@ func (c *Conn) close(sendBye bool) {
 		cancel()
 	}
 
-	if rtpConn != nil {
-		_ = rtpConn.Close()
-	}
+	closeSessions(sessions)
 
 	for _, sender := range senders {
 		sender.Close()
@@ -380,6 +497,115 @@ func (c *Conn) readBye(req *sipmsg.Request, tx sipmsg.ServerTransaction) error {
 	return dialog.ReadBye(req, tx)
 }
 
+func buildLocalMedia(kind string, send, recv []*core.Codec) *core.Media {
+	hasSend := len(send) > 0
+	hasRecv := len(recv) > 0
+	if !hasSend && !hasRecv {
+		return nil
+	}
+
+	codecs := append([]*core.Codec(nil), send...)
+	codecs = appendUniqueCodecs(codecs, recv)
+
+	return &core.Media{
+		Kind:      kind,
+		Direction: mediaDirection(hasSend, hasRecv),
+		Codecs:    codecs,
+	}
+}
+
+func collectSenderCodecs(tracks []*core.Sender, kind string) []*core.Codec {
+	codecs := make([]*core.Codec, 0, len(tracks))
+	nextDynamic := byte(96)
+
+	for _, track := range tracks {
+		if track.Media.Kind != kind {
+			continue
+		}
+
+		codec := normalizeCodecForSDP(track.Codec, &nextDynamic)
+		codecs = appendUniqueCodecs(codecs, []*core.Codec{codec})
+	}
+
+	return codecs
+}
+
+func collectReceiverCodecs(tracks []*core.Receiver, kind string) []*core.Codec {
+	codecs := make([]*core.Codec, 0, len(tracks))
+	nextDynamic := byte(96)
+
+	for _, track := range tracks {
+		if track.Media.Kind != kind {
+			continue
+		}
+
+		codec := normalizeCodecForSDP(track.Codec, &nextDynamic)
+		codecs = appendUniqueCodecs(codecs, []*core.Codec{codec})
+	}
+
+	return codecs
+}
+
+func normalizeCodecForSDP(codec *core.Codec, nextDynamic *byte) *core.Codec {
+	clone := codec.Clone()
+	if clone.ClockRate == 0 && clone.IsVideo() {
+		clone.ClockRate = 90000
+	}
+	if clone.PayloadType == core.PayloadTypeRAW || (clone.IsVideo() && clone.PayloadType < 96) {
+		clone.PayloadType = *nextDynamic
+		*nextDynamic++
+	}
+	return clone
+}
+
+func appendUniqueCodecs(dst, src []*core.Codec) []*core.Codec {
+	for _, codec := range src {
+		duplicate := false
+		for _, existing := range dst {
+			if existing.Match(codec) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			dst = append(dst, codec.Clone())
+		}
+	}
+	return dst
+}
+
+func newMediaSession(kind string) (*mediaSession, error) {
+	rtpConn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+	if err != nil {
+		return nil, err
+	}
+	return &mediaSession{kind: kind, rtpConn: rtpConn}, nil
+}
+
+func cloneSessions(src map[string]*mediaSession) map[string]*mediaSession {
+	if len(src) == 0 {
+		return nil
+	}
+
+	dst := make(map[string]*mediaSession, len(src))
+	for kind, session := range src {
+		dst[kind] = session
+	}
+	return dst
+}
+
+func closeSessions(sessions map[string]*mediaSession) {
+	for _, session := range sessions {
+		if session.rtpConn != nil {
+			_ = session.rtpConn.Close()
+		}
+	}
+}
+
+func isExpectedClose(err error) bool {
+	return err == nil || errors.Is(err, context.Canceled) || errors.Is(err, errSIPClosed)
+}
+
 func defaultSIPPort(port int) int {
 	if port == 0 {
 		return 5060
@@ -387,10 +613,17 @@ func defaultSIPPort(port int) int {
 	return port
 }
 
-func supportedCodecs() []*core.Codec {
+func supportedAudioCodecs() []*core.Codec {
 	return []*core.Codec{
 		{Name: core.CodecPCMA, ClockRate: 8000, PayloadType: 8},
 		{Name: core.CodecPCMU, ClockRate: 8000, PayloadType: 0},
+	}
+}
+
+func supportedVideoCodecs() []*core.Codec {
+	return []*core.Codec{
+		{Name: core.CodecH264, ClockRate: 90000},
+		{Name: core.CodecH265, ClockRate: 90000},
 	}
 }
 
@@ -398,10 +631,14 @@ func (c *Conn) String() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	codec := ""
-	if c.codec != nil {
-		codec = c.codec.String()
+	parts := make([]string, 0, len(c.sessions))
+	for kind, session := range c.sessions {
+		codec := ""
+		if session.codec != nil {
+			codec = session.codec.String()
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", kind, codec))
 	}
 
-	return fmt.Sprintf("sip codec=%s remote=%v", codec, c.remoteAddr)
+	return fmt.Sprintf("sip medias=%v", parts)
 }

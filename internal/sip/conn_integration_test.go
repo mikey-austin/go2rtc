@@ -2,7 +2,6 @@ package sip
 
 import (
 	"context"
-	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -16,6 +15,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var (
+	testAudioCodec = &core.Codec{Name: core.CodecPCMU, ClockRate: 8000, PayloadType: 0}
+	testVideoCodec = &core.Codec{
+		Name:        core.CodecH264,
+		ClockRate:   90000,
+		PayloadType: 96,
+		FmtpLine:    "packetization-mode=1;profile-level-id=42e01f;sprop-parameter-sets=Z0LgHtoCgPaE,aM4G4g==",
+	}
+)
+
 func TestConnInviteAndRTPBridge(t *testing.T) {
 	oldManager := manager
 	oldCalls := calls
@@ -23,62 +32,45 @@ func TestConnInviteAndRTPBridge(t *testing.T) {
 	calls = sync.Map{}
 
 	t.Cleanup(func() {
-		if manager != nil {
-			if manager.listener != nil {
-				_ = manager.listener.Close()
-			}
-			if manager.ua != nil {
-				_ = manager.ua.Close()
-			}
-		}
+		closeManager(manager)
 		manager = oldManager
 		calls = oldCalls
 	})
 
 	server := startTestSIPServer(t)
-	defer server.rtpConn.Close()
 
 	conn, err := manager.newConn("sip:doorbell@" + server.addr)
 	require.NoError(t, err)
 
-	inCodec := &core.Codec{Name: core.CodecPCMU, ClockRate: 8000, PayloadType: 0}
-	inTrack, err := conn.GetTrack(conn.Medias[1], inCodec)
+	audioInTrack, err := conn.GetTrack(conn.Medias[1], testAudioCodec)
 	require.NoError(t, err)
 
-	inPackets := make(chan *rtp.Packet, 1)
-	inSender := core.NewSender(conn.Medias[1], inCodec)
-	inSender.Handler = func(packet *rtp.Packet) {
-		clone := *packet
-		clone.Payload = append([]byte(nil), packet.Payload...)
-		inPackets <- &clone
+	audioInPackets := make(chan *rtp.Packet, 1)
+	audioInSender := core.NewSender(conn.Medias[1], testAudioCodec)
+	audioInSender.Handler = func(packet *rtp.Packet) {
+		audioInPackets <- clonePacket(packet)
 	}
-	inSender.HandleRTP(inTrack)
+	audioInSender.HandleRTP(audioInTrack)
 	defer func() {
-		inSender.Close()
-		inSender.Wait()
+		audioInSender.Close()
+		audioInSender.Wait()
 	}()
 
-	outTrack := core.NewReceiver(conn.Medias[0], inCodec)
-	require.NoError(t, conn.AddTrack(conn.Medias[0], inCodec, outTrack))
+	audioOutTrack := core.NewReceiver(conn.Medias[0], testAudioCodec)
+	require.NoError(t, conn.AddTrack(conn.Medias[0], testAudioCodec, audioOutTrack))
+
+	videoOutTrack := core.NewReceiver(conn.Medias[2], testVideoCodec)
+	require.NoError(t, conn.AddTrack(conn.Medias[2], testVideoCodec, videoOutTrack))
 
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- conn.Start()
 	}()
 
-	var callerRTP *net.UDPAddr
-	select {
-	case callerRTP = <-server.callerRTP:
-	case err = <-server.errs:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting caller RTP address")
-	}
-
 	require.Eventually(t, func() bool {
 		conn.mu.RLock()
 		defer conn.mu.RUnlock()
-		return conn.rtpConn != nil && conn.codec != nil && conn.remoteAddr != nil
+		return conn.sessions[core.KindAudio] != nil && conn.sessions[core.KindVideo] != nil
 	}, 5*time.Second, 20*time.Millisecond)
 
 	select {
@@ -89,7 +81,7 @@ func TestConnInviteAndRTPBridge(t *testing.T) {
 		t.Fatal("timeout waiting for ACK")
 	}
 
-	serverPacket := &rtp.Packet{
+	serverAudio := &rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
 			PayloadType:    0,
@@ -99,22 +91,22 @@ func TestConnInviteAndRTPBridge(t *testing.T) {
 		},
 		Payload: []byte{1, 2, 3, 4},
 	}
-	data, err := serverPacket.Marshal()
+	data, err := serverAudio.Marshal()
 	require.NoError(t, err)
 
-	_, err = server.rtpConn.WriteToUDP(data, callerRTP)
+	_, err = server.audioRTP.WriteToUDP(data, server.remote[core.KindAudio].Addr)
 	require.NoError(t, err)
 
 	select {
-	case packet := <-inPackets:
-		require.Equal(t, serverPacket.Payload, packet.Payload)
+	case packet := <-audioInPackets:
+		require.Equal(t, serverAudio.Payload, packet.Payload)
 	case err = <-server.errs:
 		require.NoError(t, err)
 	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting inbound RTP")
+		t.Fatal("timeout waiting inbound audio RTP")
 	}
 
-	outPacket := &rtp.Packet{
+	audioOut := &rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
 			PayloadType:    0,
@@ -124,15 +116,36 @@ func TestConnInviteAndRTPBridge(t *testing.T) {
 		},
 		Payload: []byte{9, 8, 7, 6},
 	}
-	outTrack.WriteRTP(outPacket)
+	audioOutTrack.WriteRTP(audioOut)
 
 	select {
-	case packet := <-server.received:
-		require.Equal(t, outPacket.Payload, packet.Payload)
+	case packet := <-server.audioReceived:
+		require.Equal(t, audioOut.Payload, packet.Payload)
 	case err = <-server.errs:
 		require.NoError(t, err)
 	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting outbound RTP")
+		t.Fatal("timeout waiting outbound audio RTP")
+	}
+
+	videoOut := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    96,
+			SequenceNumber: 300,
+			Timestamp:      9000,
+			SSRC:           5678,
+		},
+		Payload: []byte{5, 4, 3, 2},
+	}
+	videoOutTrack.WriteRTP(videoOut)
+
+	select {
+	case packet := <-server.videoReceived:
+		require.Equal(t, videoOut.Payload, packet.Payload)
+	case err = <-server.errs:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting outbound video RTP")
 	}
 
 	require.NoError(t, conn.Stop())
@@ -153,120 +166,6 @@ func TestConnInviteAndRTPBridge(t *testing.T) {
 	}
 }
 
-type testServer struct {
-	rtpConn   *net.UDPConn
-	addr      string
-	callerRTP chan *net.UDPAddr
-	acked     chan struct{}
-	byed      chan struct{}
-	received  chan *rtp.Packet
-	errs      chan error
-}
-
-func startTestSIPServer(t *testing.T) *testServer {
-	t.Helper()
-
-	ua, err := sipgo.NewUA(sipgo.WithUserAgent("sip-test"))
-	require.NoError(t, err)
-
-	srv, err := sipgo.NewServer(ua)
-	require.NoError(t, err)
-
-	sipConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	serverRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-	require.NoError(t, err)
-
-	ts := &testServer{
-		rtpConn:   serverRTP,
-		addr:      sipConn.LocalAddr().String(),
-		callerRTP: make(chan *net.UDPAddr, 1),
-		acked:     make(chan struct{}, 1),
-		byed:      make(chan struct{}, 1),
-		received:  make(chan *rtp.Packet, 1),
-		errs:      make(chan error, 4),
-	}
-
-	t.Cleanup(func() {
-		_ = sipConn.Close()
-		_ = serverRTP.Close()
-		_ = ua.Close()
-	})
-
-	go func() {
-		buf := make([]byte, 1500)
-		for {
-			n, _, err := serverRTP.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-
-			packet := &rtp.Packet{}
-			if err = packet.Unmarshal(buf[:n]); err != nil {
-				continue
-			}
-
-			clone := *packet
-			clone.Payload = append([]byte(nil), packet.Payload...)
-			ts.received <- &clone
-		}
-	}()
-
-	srv.OnInvite(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
-		addr, codec, err := ParseOffer(req.Body(), []*core.Codec{
-			{Name: core.CodecPCMU, ClockRate: 8000, PayloadType: 0},
-		})
-		if err != nil {
-			ts.errs <- err
-			return
-		}
-		if codec.Name != core.CodecPCMU {
-			ts.errs <- errors.New("unexpected negotiated codec")
-			return
-		}
-		ts.callerRTP <- addr
-
-		answer, err := buildAnswer("127.0.0.1", serverRTP.LocalAddr().(*net.UDPAddr).Port, codec)
-		if err != nil {
-			ts.errs <- err
-			return
-		}
-
-		res := sipmsg.NewResponseFromRequest(req, 200, "OK", answer)
-		res.AppendHeader(sipmsg.NewHeader("Content-Type", "application/sdp"))
-		res.AppendHeader(&sipmsg.ContactHeader{
-			Address: sipmsg.Uri{
-				Scheme: "sip",
-				User:   "doorbell",
-				Host:   "127.0.0.1",
-				Port:   sipConn.LocalAddr().(*net.UDPAddr).Port,
-			},
-		})
-		if err = tx.Respond(res); err != nil {
-			ts.errs <- err
-		}
-	})
-
-	srv.OnAck(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
-		ts.acked <- struct{}{}
-	})
-
-	srv.OnBye(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
-		ts.byed <- struct{}{}
-		res := sipmsg.NewResponseFromRequest(req, 200, "OK", nil)
-		if err := tx.Respond(res); err != nil {
-			ts.errs <- err
-		}
-	})
-
-	go func() {
-		_ = srv.ServeUDP(sipConn)
-	}()
-
-	return ts
-}
-
 func TestConnAcceptsInboundInviteAndRTPBridge(t *testing.T) {
 	oldManager := manager
 	oldCalls := calls
@@ -274,14 +173,7 @@ func TestConnAcceptsInboundInviteAndRTPBridge(t *testing.T) {
 	calls = sync.Map{}
 
 	t.Cleanup(func() {
-		if manager != nil {
-			if manager.listener != nil {
-				_ = manager.listener.Close()
-			}
-			if manager.ua != nil {
-				_ = manager.ua.Close()
-			}
-		}
+		closeManager(manager)
 		manager = oldManager
 		calls = oldCalls
 	})
@@ -289,7 +181,7 @@ func TestConnAcceptsInboundInviteAndRTPBridge(t *testing.T) {
 	require.NoError(t, manager.ensureServer())
 
 	streamName := "sip-inbound-doorbell"
-	source := newTestAudioSource()
+	source := newTestAVSource()
 	streams.HandleFunc("testsip-inbound", func(string) (core.Producer, error) {
 		return source, nil
 	})
@@ -302,15 +194,27 @@ func TestConnAcceptsInboundInviteAndRTPBridge(t *testing.T) {
 		_ = source.Stop()
 	})
 
-	clientRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	clientAudioRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	require.NoError(t, err)
-	defer clientRTP.Close()
+	defer clientAudioRTP.Close()
 
-	clientPackets := make(chan *rtp.Packet, 1)
-	go readRTPPackets(clientRTP, clientPackets)
+	clientVideoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	require.NoError(t, err)
+	defer clientVideoRTP.Close()
 
-	offerCodec := &core.Codec{Name: core.CodecPCMU, ClockRate: 8000, PayloadType: 0}
-	offer, err := BuildOffer("127.0.0.1", clientRTP.LocalAddr().(*net.UDPAddr).Port, []*core.Codec{offerCodec})
+	clientAudioPackets := make(chan *rtp.Packet, 1)
+	clientVideoPackets := make(chan *rtp.Packet, 1)
+	go readRTPPackets(clientAudioRTP, clientAudioPackets)
+	go readRTPPackets(clientVideoRTP, clientVideoPackets)
+
+	callerMedias := []*core.Media{
+		{Kind: core.KindAudio, Direction: core.DirectionSendRecv, Codecs: []*core.Codec{testAudioCodec.Clone()}},
+		{Kind: core.KindVideo, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{testVideoCodec.Clone()}},
+	}
+	offer, err := BuildOffer("127.0.0.1", map[string]int{
+		core.KindAudio: clientAudioRTP.LocalAddr().(*net.UDPAddr).Port,
+		core.KindVideo: clientVideoRTP.LocalAddr().(*net.UDPAddr).Port,
+	}, callerMedias)
 	require.NoError(t, err)
 
 	ua, err := sipgo.NewUA(sipgo.WithUserAgent("sip-test"))
@@ -354,54 +258,72 @@ func TestConnAcceptsInboundInviteAndRTPBridge(t *testing.T) {
 	require.NoError(t, dialog.WaitAnswer(ctx, sipgo.AnswerOptions{}))
 	require.NoError(t, dialog.Ack(context.Background()))
 
-	remoteRTP, codec, err := ParseAnswer(dialog.InviteResponse.Body(), []*core.Codec{offerCodec})
+	remote, err := ParseAnswer(dialog.InviteResponse.Body(), callerMedias)
 	require.NoError(t, err)
-	require.Equal(t, core.CodecPCMU, codec.Name)
 
-	clientPacket := &rtp.Packet{
+	clientAudio := &rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
-			PayloadType:    codec.PayloadType,
+			PayloadType:    0,
 			SequenceNumber: 111,
 			Timestamp:      160,
 			SSRC:           555,
 		},
 		Payload: []byte{1, 2, 3, 4},
 	}
-	data, err := clientPacket.Marshal()
+	data, err := clientAudio.Marshal()
 	require.NoError(t, err)
 
-	_, err = clientRTP.WriteToUDP(data, remoteRTP)
+	_, err = clientAudioRTP.WriteToUDP(data, remote[core.KindAudio].Addr)
 	require.NoError(t, err)
 
 	select {
 	case packet := <-source.micPackets:
-		require.Equal(t, clientPacket.Payload, packet.Payload)
+		require.Equal(t, clientAudio.Payload, packet.Payload)
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting stream backchannel RTP")
 	}
 
 	require.Eventually(t, func() bool {
-		return source.cameraTrack() != nil
+		return source.audioTrack() != nil && source.videoTrack() != nil
 	}, 3*time.Second, 20*time.Millisecond)
 
-	cameraPacket := &rtp.Packet{
+	cameraAudio := &rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
-			PayloadType:    codec.PayloadType,
+			PayloadType:    0,
 			SequenceNumber: 222,
 			Timestamp:      320,
 			SSRC:           777,
 		},
 		Payload: []byte{9, 8, 7, 6},
 	}
-	source.cameraTrack().WriteRTP(cameraPacket)
+	source.audioTrack().WriteRTP(cameraAudio)
 
 	select {
-	case packet := <-clientPackets:
-		require.Equal(t, cameraPacket.Payload, packet.Payload)
+	case packet := <-clientAudioPackets:
+		require.Equal(t, cameraAudio.Payload, packet.Payload)
 	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting caller RTP")
+		t.Fatal("timeout waiting caller audio RTP")
+	}
+
+	cameraVideo := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    96,
+			SequenceNumber: 333,
+			Timestamp:      9000,
+			SSRC:           888,
+		},
+		Payload: []byte{7, 7, 7, 7},
+	}
+	source.videoTrack().WriteRTP(cameraVideo)
+
+	select {
+	case packet := <-clientVideoPackets:
+		require.Equal(t, cameraVideo.Payload, packet.Payload)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting caller video RTP")
 	}
 
 	require.NoError(t, dialog.Bye(context.Background()))
@@ -410,54 +332,165 @@ func TestConnAcceptsInboundInviteAndRTPBridge(t *testing.T) {
 	}, 3*time.Second, 20*time.Millisecond)
 }
 
-func buildAnswer(localIP string, localPort int, codec *core.Codec) ([]byte, error) {
-	return BuildOffer(localIP, localPort, []*core.Codec{codec})
+type testServer struct {
+	audioRTP      *net.UDPConn
+	videoRTP      *net.UDPConn
+	addr          string
+	remote        map[string]*NegotiatedMedia
+	acked         chan struct{}
+	byed          chan struct{}
+	audioReceived chan *rtp.Packet
+	videoReceived chan *rtp.Packet
+	errs          chan error
 }
 
-type testAudioSource struct {
+func startTestSIPServer(t *testing.T) *testServer {
+	t.Helper()
+
+	ua, err := sipgo.NewUA(sipgo.WithUserAgent("sip-test"))
+	require.NoError(t, err)
+
+	srv, err := sipgo.NewServer(ua)
+	require.NoError(t, err)
+
+	sipConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	audioRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	require.NoError(t, err)
+
+	videoRTP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	require.NoError(t, err)
+
+	ts := &testServer{
+		audioRTP:      audioRTP,
+		videoRTP:      videoRTP,
+		addr:          sipConn.LocalAddr().String(),
+		remote:        make(map[string]*NegotiatedMedia, 2),
+		acked:         make(chan struct{}, 1),
+		byed:          make(chan struct{}, 1),
+		audioReceived: make(chan *rtp.Packet, 1),
+		videoReceived: make(chan *rtp.Packet, 1),
+		errs:          make(chan error, 4),
+	}
+
+	t.Cleanup(func() {
+		_ = sipConn.Close()
+		_ = audioRTP.Close()
+		_ = videoRTP.Close()
+		_ = ua.Close()
+	})
+
+	go readRTPPackets(audioRTP, ts.audioReceived)
+	go readRTPPackets(videoRTP, ts.videoReceived)
+
+	serverMedias := []*core.Media{
+		{Kind: core.KindAudio, Direction: core.DirectionSendRecv, Codecs: []*core.Codec{testAudioCodec.Clone()}},
+		{Kind: core.KindVideo, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{testVideoCodec.Clone()}},
+	}
+
+	srv.OnInvite(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+		answerMedias, remote, err := AnswerOffer(req.Body(), serverMedias)
+		if err != nil {
+			ts.errs <- err
+			return
+		}
+		ts.remote = remote
+
+		answer, err := BuildOffer("127.0.0.1", map[string]int{
+			core.KindAudio: audioRTP.LocalAddr().(*net.UDPAddr).Port,
+			core.KindVideo: videoRTP.LocalAddr().(*net.UDPAddr).Port,
+		}, answerMedias)
+		if err != nil {
+			ts.errs <- err
+			return
+		}
+
+		res := sipmsg.NewResponseFromRequest(req, 200, "OK", answer)
+		res.AppendHeader(sipmsg.NewHeader("Content-Type", "application/sdp"))
+		res.AppendHeader(&sipmsg.ContactHeader{
+			Address: sipmsg.Uri{
+				Scheme: "sip",
+				User:   "doorbell",
+				Host:   "127.0.0.1",
+				Port:   sipConn.LocalAddr().(*net.UDPAddr).Port,
+			},
+		})
+		if err = tx.Respond(res); err != nil {
+			ts.errs <- err
+		}
+	})
+
+	srv.OnAck(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+		ts.acked <- struct{}{}
+	})
+
+	srv.OnBye(func(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+		ts.byed <- struct{}{}
+		res := sipmsg.NewResponseFromRequest(req, 200, "OK", nil)
+		if err := tx.Respond(res); err != nil {
+			ts.errs <- err
+		}
+	})
+
+	go func() {
+		_ = srv.ServeUDP(sipConn)
+	}()
+
+	return ts
+}
+
+type testAVSource struct {
 	medias     []*core.Media
 	mu         sync.RWMutex
-	camera     *core.Receiver
+	audio      *core.Receiver
+	video      *core.Receiver
 	senders    []*core.Sender
 	micPackets chan *rtp.Packet
 	done       chan struct{}
 	closeOnce  sync.Once
 }
 
-func newTestAudioSource() *testAudioSource {
-	codec := &core.Codec{Name: core.CodecPCMU, ClockRate: 8000, PayloadType: 0}
-	return &testAudioSource{
+func newTestAVSource() *testAVSource {
+	return &testAVSource{
 		medias: []*core.Media{
-			{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{codec.Clone()}},
-			{Kind: core.KindAudio, Direction: core.DirectionSendonly, Codecs: []*core.Codec{codec.Clone()}},
+			{Kind: core.KindAudio, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{testAudioCodec.Clone()}},
+			{Kind: core.KindVideo, Direction: core.DirectionRecvonly, Codecs: []*core.Codec{testVideoCodec.Clone()}},
+			{Kind: core.KindAudio, Direction: core.DirectionSendonly, Codecs: []*core.Codec{testAudioCodec.Clone()}},
 		},
 		micPackets: make(chan *rtp.Packet, 1),
 		done:       make(chan struct{}),
 	}
 }
 
-func (s *testAudioSource) GetMedias() []*core.Media {
+func (s *testAVSource) GetMedias() []*core.Media {
 	return s.medias
 }
 
-func (s *testAudioSource) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
+func (s *testAVSource) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.camera != nil {
-		return s.camera, nil
+	switch media.Kind {
+	case core.KindAudio:
+		if s.audio == nil {
+			s.audio = core.NewReceiver(media, codec.Clone())
+		}
+		return s.audio, nil
+	case core.KindVideo:
+		if s.video == nil {
+			s.video = core.NewReceiver(media, codec.Clone())
+		}
+		return s.video, nil
+	default:
+		return nil, core.ErrCantGetTrack
 	}
-
-	s.camera = core.NewReceiver(media, codec.Clone())
-	return s.camera, nil
 }
 
-func (s *testAudioSource) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
+func (s *testAVSource) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
 	sender := core.NewSender(media, codec.Clone())
 	sender.Handler = func(packet *rtp.Packet) {
-		clone := *packet
-		clone.Payload = append([]byte(nil), packet.Payload...)
-		s.micPackets <- &clone
+		s.micPackets <- clonePacket(packet)
 	}
 	sender.HandleRTP(track)
 
@@ -468,25 +501,30 @@ func (s *testAudioSource) AddTrack(media *core.Media, codec *core.Codec, track *
 	return nil
 }
 
-func (s *testAudioSource) Start() error {
+func (s *testAVSource) Start() error {
 	<-s.done
 	return nil
 }
 
-func (s *testAudioSource) Stop() error {
+func (s *testAVSource) Stop() error {
 	s.mu.Lock()
 	senders := append([]*core.Sender(nil), s.senders...)
-	camera := s.camera
+	audio := s.audio
+	video := s.video
 	s.senders = nil
-	s.camera = nil
+	s.audio = nil
+	s.video = nil
 	s.mu.Unlock()
 
 	for _, sender := range senders {
 		sender.Close()
 		sender.Wait()
 	}
-	if camera != nil {
-		camera.Close()
+	if audio != nil {
+		audio.Close()
+	}
+	if video != nil {
+		video.Close()
 	}
 	s.closeOnce.Do(func() {
 		close(s.done)
@@ -494,10 +532,16 @@ func (s *testAudioSource) Stop() error {
 	return nil
 }
 
-func (s *testAudioSource) cameraTrack() *core.Receiver {
+func (s *testAVSource) audioTrack() *core.Receiver {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.camera
+	return s.audio
+}
+
+func (s *testAVSource) videoTrack() *core.Receiver {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.video
 }
 
 func readRTPPackets(conn *net.UDPConn, out chan<- *rtp.Packet) {
@@ -513,10 +557,14 @@ func readRTPPackets(conn *net.UDPConn, out chan<- *rtp.Packet) {
 			continue
 		}
 
-		clone := *packet
-		clone.Payload = append([]byte(nil), packet.Payload...)
-		out <- &clone
+		out <- clonePacket(packet)
 	}
+}
+
+func clonePacket(packet *rtp.Packet) *rtp.Packet {
+	clone := *packet
+	clone.Payload = append([]byte(nil), packet.Payload...)
+	return &clone
 }
 
 func inboundDialogsLen(m *Manager) int {
@@ -526,4 +574,16 @@ func inboundDialogsLen(m *Manager) int {
 		return true
 	})
 	return n
+}
+
+func closeManager(m *Manager) {
+	if m == nil {
+		return
+	}
+	if m.listener != nil {
+		_ = m.listener.Close()
+	}
+	if m.ua != nil {
+		_ = m.ua.Close()
+	}
 }

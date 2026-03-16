@@ -183,31 +183,48 @@ func (m *Manager) handleInvite(req *sipmsg.Request, tx sipmsg.ServerTransaction)
 		return
 	}
 
-	remoteAddr, codec, err := ParseOffer(req.Body(), supportedCodecs())
+	conn := NewInboundConn(m, req, streamName)
+
+	stream.AddProducer(conn)
+	if err = stream.AddConsumer(conn); err != nil {
+		detachStreamConn(stream, conn)
+		_ = conn.Stop()
+		res := sipmsg.NewResponseFromRequest(req, 500, "Server Error", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	localMedias, sessions, ports, err := conn.localMedias()
 	if err != nil {
+		detachStreamConn(stream, conn)
+		_ = conn.Stop()
+		res := sipmsg.NewResponseFromRequest(req, 488, "Not Acceptable Here", nil)
+		_ = tx.Respond(res)
+		return
+	}
+
+	answerMedias, remote, err := AnswerOffer(req.Body(), localMedias)
+	if err != nil {
+		closeSessions(sessions)
+		detachStreamConn(stream, conn)
+		_ = conn.Stop()
 		log.Debug().Err(err).Str("stream", streamName).Msg("[sip] offer")
 		res := sipmsg.NewResponseFromRequest(req, 488, "Not Acceptable Here", nil)
 		_ = tx.Respond(res)
 		return
 	}
 
-	localRTP, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+	answer, err := BuildOffer(localIP, ports, answerMedias)
 	if err != nil {
+		closeSessions(sessions)
+		detachStreamConn(stream, conn)
+		_ = conn.Stop()
 		res := sipmsg.NewResponseFromRequest(req, 500, "Server Error", nil)
 		_ = tx.Respond(res)
 		return
 	}
 
-	answer, err := BuildOffer(localIP, localRTP.LocalAddr().(*net.UDPAddr).Port, []*core.Codec{codec})
-	if err != nil {
-		_ = localRTP.Close()
-		res := sipmsg.NewResponseFromRequest(req, 500, "Server Error", nil)
-		_ = tx.Respond(res)
-		return
-	}
-
-	conn := NewInboundConn(m, req, streamName)
-	conn.attachInbound(dialog, localRTP, remoteAddr, codec, answer)
+	conn.attachInbound(dialog, sessions, remote, answer)
 	conn.onClose = func() {
 		m.inbound.Delete(dialog.ID)
 		detachStreamConn(stream, conn)
@@ -218,14 +235,6 @@ func (m *Manager) handleInvite(req *sipmsg.Request, tx sipmsg.ServerTransaction)
 			conn.close(false)
 		}
 	})
-
-	stream.AddProducer(conn)
-	if err = stream.AddConsumer(conn); err != nil {
-		_ = conn.Stop()
-		res := sipmsg.NewResponseFromRequest(req, 500, "Server Error", nil)
-		_ = tx.Respond(res)
-		return
-	}
 
 	m.inbound.Store(dialog.ID, conn)
 	go m.runCall(conn, streamName, req.Source())
