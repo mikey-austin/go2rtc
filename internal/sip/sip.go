@@ -40,6 +40,14 @@ func Init() {
 
 	streams.HandleFunc("sip", Dial)
 	api.HandleFunc("api/sip", handleAPI)
+
+	// Start the SIP listener eagerly if a listen address is configured,
+	// so inbound INVITEs can be received without waiting for first use.
+	if cfg.Mod.Listen != "" {
+		if err := manager.ensureServer(); err != nil {
+			log.Error().Err(err).Msg("[sip] failed to start listener")
+		}
+	}
 }
 
 var (

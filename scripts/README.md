@@ -1,6 +1,6 @@
 # Scripts
 
-This folder contains a script for building binaries for all platforms.
+This folder contains scripts for building binaries and Docker images.
 
 The project has no `CGO` dependencies, so building is as simple as possible using the `go build` command.
 
@@ -9,6 +9,18 @@ The project has to use the latest versions of go due to dependencies on third-pa
 The project uses [UPX](https://github.com/upx/upx) to compress binaries for Linux. The project does not use compression for Windows due to false antivirus alarms. The project does not use compression for macOS due to broken result.
 
 ## Useful commands
+
+Build the default Docker image for `linux/amd64`:
+
+```bash
+./scripts/docker-build.sh registry.nas.jackiemclean.net/go2rtc:sip-20260316-1
+```
+
+Build for another platform:
+
+```bash
+./scripts/docker-build.sh registry.nas.jackiemclean.net/go2rtc:sip-20260316-1 linux/arm64
+```
 
 ```
 go get -u
